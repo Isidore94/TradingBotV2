@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import json
+import logging
+import threading
+from datetime import datetime, timedelta
+
+import requests
+import pandas as pd
+import yfinance as yf
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+
+# ── Configuration ────────────────────────────────────────────────
+LONGS_FILE          = "longs.txt"
+SHORTS_FILE         = "shorts.txt"
+EARNINGS_CACHE_FILE = "earnings_cache.json"
+LOG_FILE            = "combined_avwap.txt"
+API_URL             = "https://api.nasdaq.com/api/calendar/earnings?date={date}"
+HEADERS             = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json, text/plain, */*"
+}
+MAX_LOOKBACK_DAYS   = 150     # days back to scan for earnings
+RECENT_DAYS         = 10      # if most recent earnings < RECENT_DAYS, pick previous
+FETCH_INTERVAL      = 45 * 60 # seconds between runs (45m)
+
+# ── Output Filters (set True/False to control log output) ──────────
+OUTPUT_TIER1                = True   # Between 1σ and 2σ (Above UPPER_1 / Below LOWER_1)
+OUTPUT_TIER2                = True   # Between 2σ and 3σ (Above UPPER_2 / Below LOWER_2)
+OUTPUT_TIER3                = False  # Above UPPER_3 / Below LOWER_3
+OUTPUT_VWAP                 = True   # VWAP touches/crosses in last 2 days
+OUTPUT_CROSS_UPS_LONG       = True   # LONG: yesterday <= UPPER_k and today > UPPER_k
+OUTPUT_CROSS_DOWNS_SHORT    = True   # SHORT: yesterday >= LOWER_k and today < LOWER_k
+
+# ── Logging Setup ───────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S"
+)
+
+# ── Utility: Load tickers ───────────────────────────────────────
+def load_tickers_from_file(path):
+    if not os.path.exists(path):
+        logging.warning(f"Ticker file not found: {path}")
+        return []
+    tickers = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            val = line.strip()
+            if not val or val.upper().startswith("SYMBOLS FROM TC2000"):
+                continue
+            tickers.append(val.upper())
+    return tickers
+
+# ── Earnings Date Cache ────────────────────────────────────────
+def load_earnings_cache():
+    if os.path.exists(EARNINGS_CACHE_FILE):
+        with open(EARNINGS_CACHE_FILE, 'r', encoding='utf-8') as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                logging.warning("Earnings cache file is corrupt; starting fresh.")
+                return {}
+    return {}
+
+def save_earnings_cache(cache):
+    with open(EARNINGS_CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cache, f, indent=2)
+
+# ── Nasdaq Earnings Lookup ─────────────────────────────────────
+def fetch_earnings_for_date(date_str):
+    try:
+        resp = requests.get(API_URL.format(date=date_str),
+                            headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get('data', {}).get('rows', []) or []
+    except Exception as e:
+        logging.warning(f"Failed fetch earnings for {date_str}: {e}")
+        time.sleep(0.5)
+        return []
+
+def collect_earnings_dates(symbols):
+    symbol_dates = {sym: [] for sym in symbols}
+    today = datetime.now().date()
+    for delta in range(MAX_LOOKBACK_DAYS):
+        date = today - timedelta(days=delta)
+        rows = fetch_earnings_for_date(date.isoformat())
+        time.sleep(1.0)  # throttle
+        for row in rows:
+            sym = row.get('symbol','').upper()
+            if sym in symbol_dates and date.isoformat() not in symbol_dates[sym]:
+                symbol_dates[sym].append(date.isoformat())
+        if all(symbol_dates[sym] for sym in symbols):
+            break
+    return symbol_dates
+
+# ── Choose best earnings date ──────────────────────────────────
+def select_best_date(dates):
+    if not dates:
+        return None
+    today = datetime.now().date()
+    most = datetime.fromisoformat(dates[0]).date()
+    # If the most recent is extremely recent, pick the previous one
+    if (today - most).days <= RECENT_DAYS and len(dates) > 1:
+        return datetime.fromisoformat(dates[1]).date()
+    return most
+
+# ── yfinance fallback ──────────────────────────────────────────
+def get_anchor_date(symbol, cache):
+    try:
+        t = yf.Ticker(symbol)
+        ed = t.get_earnings_dates(limit=8)
+        ed.index = ed.index.tz_localize(None)
+        past = ed[ed.index < pd.Timestamp.today().tz_localize(None)]
+        if not past.empty:
+            chosen = past.index.max().date()
+            cache[symbol] = chosen.isoformat()
+            logging.info(f"Cached via yfinance {symbol} -> {chosen}")
+            return chosen
+    except Exception as e:
+        logging.warning(f"yfinance lookup failed for {symbol}: {e}")
+    return None
+
+# ── IBKR API Wrapper ───────────────────────────────────────────
+class IBApi(EWrapper, EClient):
+    def __init__(self):
+        EClient.__init__(self, self)
+        self.data  = {}
+        self.ready = {}
+
+    def historicalData(self, reqId, bar):
+        self.data.setdefault(reqId, []).append({
+            'time':   bar.date,
+            'open':   bar.open,
+            'high':   bar.high,
+            'low':    bar.low,
+            'close':  bar.close,
+            'volume': bar.volume
+        })
+
+    def historicalDataEnd(self, reqId, start, end):
+        self.ready[reqId] = True
+
+    def error(self, reqId, code, msg):
+        if code not in (2104,2106,2158,2176):
+            logging.error(f"IB Error {code}[{reqId}]: {msg}")
+
+# ── Helpers ────────────────────────────────────────────────────
+def create_contract(symbol: str) -> Contract:
+    c = Contract()
+    c.symbol   = symbol
+    c.secType  = 'STK'
+    c.exchange = 'SMART'
+    c.currency = 'USD'
+    return c
+
+# ── Price Data & AVWAP Calculation ────────────────────────────
+def fetch_daily_bars(ib, symbol, days):
+    reqId = int(time.time()*1000) % (2**31-1)
+    ib.data[reqId]  = []
+    ib.ready[reqId] = False
+
+    dur = f"{days//365} Y" if days > 365 else f"{days} D"
+
+    ib.reqHistoricalData(
+        reqId=reqId,
+        contract=create_contract(symbol),
+        endDateTime="",
+        durationStr=dur,
+        barSizeSetting="1 day",
+        whatToShow="TRADES",
+        useRTH=1,
+        formatDate=1,
+        keepUpToDate=False,
+        chartOptions=[]
+    )
+    for _ in range(60):
+        if ib.ready.get(reqId):
+            break
+        time.sleep(0.5)
+
+    bars = ib.data.pop(reqId, [])
+    ib.ready.pop(reqId, None)
+    df = pd.DataFrame(bars)
+
+    if df.empty:
+        return df
+
+    df['datetime'] = pd.to_datetime(df['time'], format='%Y%m%d', errors='coerce')
+    return df.sort_values('datetime').reset_index(drop=True)
+
+def calc_anchored_vwap_bands(df, anchor_idx, band_mult=1.0):
+    # Compute anchored VWAP and volume-weighted stdev from anchor_idx → last
+    cumVol = cumVP = cumSD = 0.0
+    for i in range(anchor_idx, len(df)):
+        row = df.iloc[i]
+        tp  = (row.open + row.high + row.low + row.close) / 4
+        v   = row.volume
+        cumVol += v
+        cumVP  += tp * v
+        vw     = cumVP / cumVol if cumVol>0 else float('nan')
+        dev    = (tp - vw) if cumVol>0 else 0.0
+        cumSD  += dev*dev * v
+    final_vwap  = cumVP / cumVol if cumVol>0 else float('nan')
+    final_stdev = (cumSD / cumVol)**0.5 if cumVol>0 else float('nan')
+    return final_vwap, final_stdev, {
+        'UPPER_1': final_vwap + band_mult*final_stdev,
+        'LOWER_1': final_vwap - band_mult*final_stdev,
+        'UPPER_2': final_vwap + 2*band_mult*final_stdev,
+        'LOWER_2': final_vwap - 2*band_mult*final_stdev,
+        'UPPER_3': final_vwap + 3*band_mult*final_stdev,
+        'LOWER_3': final_vwap - 3*band_mult*final_stdev,
+    }
+
+# ── Single Run ────────────────────────────────────────────────
+def run_once():
+    longs   = load_tickers_from_file(LONGS_FILE)
+    shorts  = load_tickers_from_file(SHORTS_FILE)
+    symbols = sorted(set(longs + shorts))
+    if not symbols:
+        logging.warning("No symbols found.")
+        return
+
+    cache    = load_earnings_cache()
+    uncached = [s for s in symbols if s not in cache]
+    if uncached:
+        logging.info(f"Fetching earnings for {len(uncached)} symbols…")
+        all_dates = collect_earnings_dates(uncached)
+        for s, dates in all_dates.items():
+            bd = select_best_date(dates)
+            if bd:
+                cache[s] = bd.isoformat()
+
+    ib = IBApi()
+    ib.connect('127.0.0.1', 7496, clientId=999)
+    threading.Thread(target=ib.run, daemon=True).start()
+    time.sleep(1.5)
+
+    # Buckets (gather everything first, then write in order)
+    tier3 = []                 # Above UPPER_3 (LONG) / Below LOWER_3 (SHORT)
+    tier2 = []                 # Between 2σ and 3σ
+    tier1 = []                 # Between 1σ and 2σ
+    vwap_crosses = []          # VWAP crosses (last 2 trading days)
+    cross_ups_long = []        # LONG: cross up through UPPER_k
+    cross_downs_short = []     # SHORT: cross down through LOWER_k
+
+    today = datetime.now().date()
+
+    for sym in symbols:
+        is_long  = sym in longs
+        is_short = sym in shorts
+        logging.info(f"→ Processing {sym} ({'LONG' if is_long else 'SHORT' if is_short else 'NA'})")
+
+        # Anchor date
+        ed_str = cache.get(sym)
+        ed = datetime.fromisoformat(ed_str).date() if ed_str else get_anchor_date(sym, cache)
+        if not ed:
+            logging.warning(f"No earnings date for {sym}")
+            continue
+
+        # Price data
+        days = max(2, (today - ed).days + 1)  # ensure at least 2 bars for cross logic
+        df   = fetch_daily_bars(ib, sym, days)
+        if df.empty:
+            logging.warning(f"No price data for {sym}")
+            continue
+
+        # Anchor index
+        idxs = df.index[df['datetime'].dt.date == ed]
+        if idxs.empty:
+            logging.warning(f"No candle on earnings date {ed} for {sym}")
+            continue
+        aidx = idxs[0]
+
+        # Bands
+        vwap, sd, bands = calc_anchored_vwap_bands(df, aidx)
+        if any(pd.isna(x) for x in [vwap, sd]):
+            logging.warning(f"NaN bands for {sym}, skipping.")
+            continue
+
+        # ─── Close classification into tiers (mutually exclusive) ───
+        last_row  = df.iloc[-1]
+        last_date = last_row['datetime'].date()
+        close     = last_row['close']
+        date_str  = last_date.strftime("%m/%d")
+
+        if is_long:
+            if close > bands['UPPER_3']:
+                tier3.append((sym, date_str, 'UPPER_3', 'LONG'))
+            elif close > bands['UPPER_2']:
+                tier2.append((sym, date_str, 'UPPER_2', 'LONG'))
+            elif close > bands['UPPER_1']:
+                tier1.append((sym, date_str, 'UPPER_1', 'LONG'))
+
+        if is_short:
+            if close < bands['LOWER_3']:
+                tier3.append((sym, date_str, 'LOWER_3', 'SHORT'))
+            elif close < bands['LOWER_2']:
+                tier2.append((sym, date_str, 'LOWER_2', 'SHORT'))
+            elif close < bands['LOWER_1']:
+                tier1.append((sym, date_str, 'LOWER_1', 'SHORT'))
+
+        # ─── VWAP crosses (last 2 trading days) ─────────────────────
+        # De-dupe: skip days that touched VWAP, UPPER_1, LOWER_1 all together
+        recent_dates = sorted(df['datetime'].dt.date.unique())[-2:]
+        hits = {d: set() for d in recent_dates}
+        levels = {'VWAP': vwap, **bands}
+        recent_df = df[df['datetime'].dt.date.isin(recent_dates)]
+        for _, row in recent_df.iterrows():
+            d = row['datetime'].date()
+            for lvl_name, lvl_val in levels.items():
+                if pd.notna(lvl_val) and row['low'] <= lvl_val <= row['high']:
+                    hits[d].add(lvl_name)
+        for d, touched in hits.items():
+            if {'VWAP','UPPER_1','LOWER_1'}.issubset(touched):
+                continue
+            if 'VWAP' in touched:
+                side = 'LONG' if is_long else 'SHORT' if is_short else 'NA'
+                if side != 'NA':
+                    vwap_crosses.append((sym, d.strftime("%m/%d"), 'VWAP', side))
+
+        # ─── Directional band crosses ───────────────────────────────
+        # LONG: yesterday below → today above UPPER_k (cross up)
+        # SHORT: yesterday above → today below LOWER_k (cross down)
+        if len(df) >= 2:
+            prev_close = df.iloc[-2]['close']
+            curr_close = df.iloc[-1]['close']
+
+            if is_long:
+                for k in (1, 2, 3):
+                    lvl = bands.get(f'UPPER_{k}')
+                    if pd.notna(lvl) and (prev_close <= lvl < curr_close):
+                        cross_ups_long.append((sym, date_str, f"CROSS_UP_UPPER_{k}", 'LONG'))
+
+            if is_short:
+                for k in (1, 2, 3):
+                    lvl = bands.get(f'LOWER_{k}')
+                    if pd.notna(lvl) and (prev_close >= lvl > curr_close):
+                        cross_downs_short.append((sym, date_str, f"CROSS_DOWN_LOWER_{k}", 'SHORT'))
+
+    # ── Writer: LONGS first then SHORTS inside each category ───────
+    def write_category(f, items):
+        for s, d, lvl, side in (x for x in items if x[3] == 'LONG'):
+            f.write(f"{s},{d},{lvl},{side}\n")
+        for s, d, lvl, side in (x for x in items if x[3] == 'SHORT'):
+            f.write(f"{s},{d},{lvl},{side}\n")
+
+    # Write the log in requested order
+    with open(LOG_FILE, 'w', encoding='utf-8') as f:
+        # 1) Above 3rd / Below 3rd
+        if OUTPUT_TIER3:
+            write_category(f, tier3)
+            f.write("\n")
+
+        # 2) Above 2nd / Below 2nd
+        if OUTPUT_TIER2:
+            write_category(f, tier2)
+            f.write("\n")
+
+        # 3) Above 1st / Below 1st
+        if OUTPUT_TIER1:
+            write_category(f, tier1)
+            f.write("\n")
+
+        # 4) VWAP crosses
+        if OUTPUT_VWAP:
+            write_category(f, vwap_crosses)
+            f.write("\n")
+
+        # 5) LONG cross-ups through UPPER_k
+        if OUTPUT_CROSS_UPS_LONG:
+            write_category(f, cross_ups_long)
+            f.write("\n")
+
+        # 6) SHORT cross-downs through LOWER_k
+        if OUTPUT_CROSS_DOWNS_SHORT:
+            write_category(f, cross_downs_short)
+
+        f.write(f"\nRun completed at {datetime.now().strftime('%H:%M:%S')}\n\n")
+
+    ib.disconnect()
+    save_earnings_cache(cache)
+    logging.info(f"Run complete. Log: {LOG_FILE}, Cache: {EARNINGS_CACHE_FILE}")
+
+# ── Main Loop ───────────────────────────────────────────────────
+if __name__ == "__main__":
+    while True:
+        run_once()
+        logging.info(f"Sleeping {FETCH_INTERVAL/60:.0f}m…")
+        time.sleep(FETCH_INTERVAL)

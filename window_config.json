@@ -1,0 +1,22 @@
+{
+  "windows": {
+    "shorts.txt": {
+      "x": 1079,
+      "y": 515,
+      "width": 400,
+      "height": 300
+    },
+    "longs.txt": {
+      "x": -1114,
+      "y": 134,
+      "width": 400,
+      "height": 300
+    },
+    "bouncers.txt": {
+      "x": -2120,
+      "y": 3,
+      "width": 400,
+      "height": 300
+    }
+  }
+}
