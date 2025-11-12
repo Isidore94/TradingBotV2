@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-import os
 import time
-import json
 import logging
 import threading
 from datetime import datetime, timedelta
 
-import requests
 import pandas as pd
-import yfinance as yf
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
+
+from shared.avwap_utils import (
+    bounce_down_at_level,
+    bounce_up_at_level,
+    calc_anchored_vwap_bands,
+    collect_earnings_dates,
+    fetch_daily_bars,
+    fetch_past_earnings_from_yfinance,
+    get_atr20,
+    load_cache,
+    load_tickers_from_file,
+    save_cache,
+)
 
 # ── Configuration ────────────────────────────────────────────────
 LONGS_FILE          = "longs.txt"
@@ -49,70 +57,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-# ── Utility: Load tickers ───────────────────────────────────────
-def load_tickers_from_file(path: str):
-    if not os.path.exists(path):
-        logging.warning(f"Ticker file not found: {path}")
-        return []
-    tickers = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            val = line.strip()
-            if not val or val.upper().startswith("SYMBOLS FROM TC2000"):
-                continue
-            tickers.append(val.upper())
-    return tickers
-
-# ── Earnings Date Cache ─────────────────────────────────────────
-def load_earnings_cache():
-    if os.path.exists(EARNINGS_CACHE_FILE):
-        with open(EARNINGS_CACHE_FILE, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                logging.warning("Earnings cache file is corrupt; starting fresh.")
-                return {}
-    return {}
-
-def save_earnings_cache(cache: dict):
-    with open(EARNINGS_CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cache, f, indent=2)
-
-# ── Nasdaq Earnings Lookup ──────────────────────────────────────
-def fetch_earnings_for_date(date_str: str):
-    try:
-        resp = requests.get(API_URL.format(date=date_str),
-                            headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        return resp.json().get("data", {}).get("rows", []) or []
-    except Exception as e:
-        logging.warning(f"Failed fetch earnings for {date_str}: {e}")
-        time.sleep(0.5)
-        return []
-
-def collect_earnings_dates(symbols):
-    symbol_dates = {sym: [] for sym in symbols}
-    today = datetime.now().date()
-
-    for delta in range(MAX_LOOKBACK_DAYS):
-        date = today - timedelta(days=delta)
-        rows = fetch_earnings_for_date(date.isoformat())
-        time.sleep(1.0)  # throttle
-        for row in rows:
-            sym = row.get("symbol", "").upper()
-            if sym in symbol_dates:
-                ds = date.isoformat()
-                if ds not in symbol_dates[sym]:
-                    symbol_dates[sym].append(ds)
-
-        if all(symbol_dates[s] for s in symbols):
-            break
-
-    # sort dates most recent first
-    for sym in symbol_dates:
-        symbol_dates[sym].sort(reverse=True)
-    return symbol_dates
-
 # ── Choose best earnings date ───────────────────────────────────
 def select_best_date(dates):
     if not dates:
@@ -125,19 +69,14 @@ def select_best_date(dates):
 
 # ── yfinance fallback ───────────────────────────────────────────
 def get_anchor_date(symbol: str, cache: dict):
-    try:
-        t = yf.Ticker(symbol)
-        ed = t.get_earnings_dates(limit=8)
-        ed.index = ed.index.tz_localize(None)
-        past = ed[ed.index < pd.Timestamp.today().tz_localize(None)]
-        if not past.empty:
-            chosen = past.index.max().date()
-            cache[symbol] = chosen.isoformat()
-            logging.info(f"Cached via yfinance {symbol} -> {chosen}")
-            return chosen
-    except Exception as e:
-        logging.warning(f"yfinance lookup failed for {symbol}: {e}")
-    return None
+    dates = fetch_past_earnings_from_yfinance(symbol)
+    if not dates:
+        return None
+
+    chosen = dates[0]
+    cache[symbol] = chosen.isoformat()
+    logging.info(f"Cached via yfinance {symbol} -> {chosen}")
+    return chosen
 
 # ── IBKR API Wrapper ────────────────────────────────────────────
 class IBApi(EWrapper, EClient):
@@ -163,170 +102,6 @@ class IBApi(EWrapper, EClient):
         if code not in (2104, 2106, 2158, 2176):
             logging.error(f"IB Error {code}[{reqId}]: {msg}")
 
-# ── Contract Helper ─────────────────────────────────────────────
-def create_contract(symbol: str) -> Contract:
-    c = Contract()
-    c.symbol   = symbol
-    c.secType  = "STK"
-    c.exchange = "SMART"
-    c.currency = "USD"
-    return c
-
-# ── Fetch Daily Bars ────────────────────────────────────────────
-def fetch_daily_bars(ib: IBApi, symbol: str, days: int) -> pd.DataFrame:
-    reqId = int(time.time() * 1000) % (2**31 - 1)
-    ib.data[reqId] = []
-    ib.ready[reqId] = False
-
-    if days > 365:
-        dur = f"{max(1, days // 365)} Y"
-    else:
-        dur = f"{max(2, days)} D"
-
-    ib.reqHistoricalData(
-        reqId=reqId,
-        contract=create_contract(symbol),
-        endDateTime="",
-        durationStr=dur,
-        barSizeSetting="1 day",
-        whatToShow="TRADES",
-        useRTH=1,
-        formatDate=1,
-        keepUpToDate=False,
-        chartOptions=[]
-    )
-
-    for _ in range(60):
-        if ib.ready.get(reqId):
-            break
-        time.sleep(0.5)
-
-    bars = ib.data.pop(reqId, [])
-    ib.ready.pop(reqId, None)
-
-    df = pd.DataFrame(bars)
-    if df.empty:
-        return df
-
-    df["datetime"] = pd.to_datetime(df["time"], format="%Y%m%d", errors="coerce")
-    df = df.sort_values("datetime").reset_index(drop=True)
-    return df
-
-# ── AVWAP + Bands ───────────────────────────────────────────────
-def calc_anchored_vwap_bands(df: pd.DataFrame, anchor_idx: int):
-    """
-    Compute anchored VWAP + volume-weighted stdev + 1/2/3σ bands from anchor_idx → end.
-    """
-    cumVol = 0.0
-    cumVP = 0.0
-    cumSD = 0.0
-
-    for i in range(anchor_idx, len(df)):
-        row = df.iloc[i]
-        v = float(row["volume"])
-        if v <= 0:
-            continue
-        tp = (row["open"] + row["high"] + row["low"] + row["close"]) / 4.0
-        cumVol += v
-        cumVP += tp * v
-        vw = cumVP / cumVol
-        dev = tp - vw
-        cumSD += dev * dev * v
-
-    if cumVol == 0:
-        return float("nan"), float("nan"), {}
-
-    final_vwap = cumVP / cumVol
-    final_stdev = (cumSD / cumVol) ** 0.5
-
-    bands = {
-        "UPPER_1": final_vwap + final_stdev,
-        "LOWER_1": final_vwap - final_stdev,
-        "UPPER_2": final_vwap + 2 * final_stdev,
-        "LOWER_2": final_vwap - 2 * final_stdev,
-        "UPPER_3": final_vwap + 3 * final_stdev,
-        "LOWER_3": final_vwap - 3 * final_stdev,
-    }
-    return final_vwap, final_stdev, bands
-
-# ── ATR(20) Helper ─────────────────────────────────────────────
-def get_atr20(df: pd.DataFrame, length: int = ATR_LENGTH):
-    """
-    Standard True Range ATR(20).
-    Needs at least length+1 rows.
-    """
-    if df is None or df.empty or len(df) < length + 1:
-        return None
-
-    highs = df["high"].values
-    lows = df["low"].values
-    closes = df["close"].values
-
-    trs = []
-    prev_close = closes[0]
-    for i in range(1, len(df)):
-        h = highs[i]
-        l = lows[i]
-        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
-        trs.append(tr)
-        prev_close = closes[i]
-
-    if len(trs) < length:
-        return None
-
-    atr_series = pd.Series(trs).rolling(length).mean()
-    atr = atr_series.iloc[-1]
-    if pd.isna(atr) or atr <= 0:
-        return None
-    return float(atr)
-
-# ── Bounce Helpers (ATR-based) ──────────────────────────────────
-def bounce_up_at_level(df: pd.DataFrame, level: float, atr: float) -> bool:
-    """
-    Long bounce:
-      eps  = 0.05 * ATR20
-      push = 0.05 * ATR20
-      B.low <= level + eps
-      B.close >= level
-      C.close > B.close and C.close >= level + push
-    """
-    if atr is None or level is None or pd.isna(level) or len(df) < ATR_LENGTH + 3:
-        return False
-
-    eps = ATR_MULT * atr
-    push = ATR_MULT * atr
-
-    A, B, C = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-
-    touched = B.low <= level + eps
-    reclaimed = B.close >= level
-    confirm = C.close > B.close and C.close >= level + push
-
-    return bool(touched and reclaimed and confirm)
-
-def bounce_down_at_level(df: pd.DataFrame, level: float, atr: float) -> bool:
-    """
-    Short bounce (rejection):
-      eps  = 0.05 * ATR20
-      push = 0.05 * ATR20
-      B.high >= level - eps
-      B.close <= level
-      C.close < B.close and C.close <= level - push
-    """
-    if atr is None or level is None or pd.isna(level) or len(df) < ATR_LENGTH + 3:
-        return False
-
-    eps = ATR_MULT * atr
-    push = ATR_MULT * atr
-
-    A, B, C = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-
-    touched = B.high >= level - eps
-    rejected = B.close <= level
-    confirm = C.close < B.close and C.close <= level - push
-
-    return bool(touched and rejected and confirm)
-
 # ── Bounce Detection Wrapper ────────────────────────────────────
 def detect_bounces_for_symbol(sym: str,
                               df: pd.DataFrame,
@@ -345,7 +120,7 @@ def detect_bounces_for_symbol(sym: str,
     if df is None or df.empty or len(df) < ATR_LENGTH + 3:
         return results
 
-    atr = get_atr20(df)
+    atr = get_atr20(df, length=ATR_LENGTH)
     if atr is None:
         return results
 
@@ -359,25 +134,25 @@ def detect_bounces_for_symbol(sym: str,
 
     # Longs
     if is_long:
-        if l2 is not None and bounce_up_at_level(df, l2, atr):
+        if l2 is not None and bounce_up_at_level(df, l2, atr=atr, atr_length=ATR_LENGTH, atr_mult=ATR_MULT):
             results.append((sym, dstr, "BOUNCE_LOWER_2", "LONG"))
-        if l1 is not None and bounce_up_at_level(df, l1, atr):
+        if l1 is not None and bounce_up_at_level(df, l1, atr=atr, atr_length=ATR_LENGTH, atr_mult=ATR_MULT):
             results.append((sym, dstr, "BOUNCE_LOWER_1", "LONG"))
-        if vwap is not None and not pd.isna(vwap) and bounce_up_at_level(df, vwap, atr):
+        if vwap is not None and not pd.isna(vwap) and bounce_up_at_level(df, vwap, atr=atr, atr_length=ATR_LENGTH, atr_mult=ATR_MULT):
             results.append((sym, dstr, "BOUNCE_VWAP", "LONG"))
-        if u1 is not None and bounce_up_at_level(df, u1, atr):
+        if u1 is not None and bounce_up_at_level(df, u1, atr=atr, atr_length=ATR_LENGTH, atr_mult=ATR_MULT):
             results.append((sym, dstr, "BOUNCE_UPPER_1", "LONG"))
 
     # Shorts
     if is_short:
-        if u2 is not None and bounce_down_at_level(df, u2, atr):
+        if u2 is not None and bounce_down_at_level(df, u2, atr=atr, atr_length=ATR_LENGTH, atr_mult=ATR_MULT):
             results.append((sym, dstr, "BOUNCE_UPPER_2", "SHORT"))
-        if u1 is not None and bounce_down_at_level(df, u1, atr):
+        if u1 is not None and bounce_down_at_level(df, u1, atr=atr, atr_length=ATR_LENGTH, atr_mult=ATR_MULT):
             results.append((sym, dstr, "BOUNCE_UPPER_1", "SHORT"))
-        if vwap is not None and not pd.isna(vwap) and bounce_down_at_level(df, vwap, atr):
+        if vwap is not None and not pd.isna(vwap) and bounce_down_at_level(df, vwap, atr=atr, atr_length=ATR_LENGTH, atr_mult=ATR_MULT):
             results.append((sym, dstr, "BOUNCE_VWAP", "SHORT"))
         # LOWER_1 as resistance after breakdown
-        if l1 is not None and bounce_down_at_level(df, l1, atr):
+        if l1 is not None and bounce_down_at_level(df, l1, atr=atr, atr_length=ATR_LENGTH, atr_mult=ATR_MULT):
             results.append((sym, dstr, "BOUNCE_LOWER_1", "SHORT"))
 
     return results
@@ -392,13 +167,20 @@ def run_once():
         logging.warning("No symbols found.")
         return
 
-    cache = load_earnings_cache()
+    cache = load_cache(EARNINGS_CACHE_FILE)
 
     # Fill cache via Nasdaq for uncached
     uncached = [s for s in symbols if s not in cache]
     if uncached:
         logging.info(f"Fetching earnings for {len(uncached)} uncached symbols…")
-        all_dates = collect_earnings_dates(uncached)
+        all_dates = collect_earnings_dates(
+            uncached,
+            max_lookback_days=MAX_LOOKBACK_DAYS,
+            api_url=API_URL,
+            headers=HEADERS,
+            throttle_seconds=1.0,
+            stop_when_all_found=True,
+        )
         for s, dates in all_dates.items():
             bd = select_best_date(dates)
             if bd:
@@ -555,7 +337,7 @@ def run_once():
         f.write(f"Run completed at {datetime.now().strftime('%H:%M:%S')}\n")
 
     ib.disconnect()
-    save_earnings_cache(cache)
+    save_cache(cache, EARNINGS_CACHE_FILE)
     logging.info(f"Run complete. Log: {LOG_FILE}, Cache: {EARNINGS_CACHE_FILE}")
 
 # ── Main Loop ───────────────────────────────────────────────────
