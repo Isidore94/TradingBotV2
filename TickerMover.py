@@ -22,8 +22,7 @@ from PyQt5.QtGui import QPalette, QColor
 SHORTS_FILE          = "shorts.txt"
 LONGS_FILE           = "longs.txt"
 BOUNCERS_FILE        = "bouncers.txt"              # old/live bouncer feed (HH:MM:SS | SYM | types | side)
-PREV_BOUNCERS_FILE   = "prev_avwap_bouncers.txt"   # new: prev-earnings AVWAP bounces script output
-COMBINED_FILE        = "combined_avwap.txt"        # main AVWAP2 output incl. BOUNCE_*
+COMBINED_FILE        = "combined_avwap.txt"        # AVWAP output (current + previous anchors)
 ALERTS_FILE          = "alerts_feed.txt"           # this script writes alerts here
 
 # Freshness / matching behavior
@@ -45,7 +44,6 @@ FILE_LIST = [
     SHORTS_FILE,
     LONGS_FILE,
     BOUNCERS_FILE,
-    PREV_BOUNCERS_FILE,
     COMBINED_FILE,
     ALERTS_FILE,
 ]
@@ -144,7 +142,6 @@ class MainWindow(QWidget):
         # newest-at-top for list-style windows
         self.newest_at_top = filename in (
             BOUNCERS_FILE,
-            PREV_BOUNCERS_FILE,
             COMBINED_FILE,
             ALERTS_FILE,
         )
@@ -305,7 +302,12 @@ class MainWindow(QWidget):
         rows = self._visible_combined_rows()
         keep = []
         for original, (_, _, level, _) in rows:
-            if level.startswith("CROSS_UP_") or level.startswith("CROSS_DOWN_"):
+            if (
+                level.startswith("CROSS_UP_")
+                or level.startswith("CROSS_DOWN_")
+                or level.startswith("PREV_CROSS_UP_")
+                or level.startswith("PREV_CROSS_DOWN_")
+            ):
                 keep.append(original)
         QApplication.clipboard().setText("\n".join(keep))
 
@@ -359,15 +361,15 @@ def _re_fullmatch(pattern: str, text: str) -> bool:
 
 def _parse_combined_line(line: str):
     """
-    combined_avwap.txt lines:
-      SYMBOL,MM/DD,LEVEL,SIDE
+    combined_avwap.txt lines now include section headers (``# ...``) followed by
+    signal rows formatted as ``SYMBOL,MM/DD,LEVEL,SIDE``.
 
     LEVEL can be:
       - UPPER_n / LOWER_n (tier classifications)
       - VWAP
       - CROSS_UP_* / CROSS_DOWN_*
-      - BOUNCE_* (current-earnings bounces)
-      - PREV_BOUNCE_* (prev-earnings bounces, if you ever co-locate)
+      - BOUNCE_* (current anchor bounces)
+      - PREV_* (previous anchor signals)
 
     Returns (sym, mmdd, level, side) or None.
     """
