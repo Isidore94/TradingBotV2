@@ -382,8 +382,10 @@ def run_once():
 
     today = datetime.now().date()
 
-    prev_bounce_longs = []   # (sym, MM/DD, PREV_BOUNCE_UPPER_1, LONG)
-    prev_bounce_shorts = []  # (sym, MM/DD, PREV_BOUNCE_LOWER_1, SHORT)
+    prev_bounce_longs = []      # (sym, MM/DD, PREV_BOUNCE_UPPER_1, LONG)
+    prev_bounce_shorts = []     # (sym, MM/DD, PREV_BOUNCE_LOWER_1, SHORT)
+    prev_cross_ups_long = []    # (sym, MM/DD, PREV_CROSS_UP_UPPER_X, LONG)
+    prev_cross_downs_short = [] # (sym, MM/DD, PREV_CROSS_DOWN_LOWER_X, SHORT)
 
     for sym in symbols:
         is_long = sym in longs
@@ -425,6 +427,23 @@ def run_once():
         upper_1 = bands.get("UPPER_1")
         lower_1 = bands.get("LOWER_1")
 
+        # ── Directional crosses of stdev bands ─────────────────
+        if len(df) >= 2:
+            prev_close = df.iloc[-2]["close"]
+            curr_close = df.iloc[-1]["close"]
+
+            if is_long:
+                for k in (1, 2, 3):
+                    lvl = bands.get(f"UPPER_{k}")
+                    if pd.notna(lvl) and prev_close <= lvl < curr_close:
+                        prev_cross_ups_long.append((sym, dstr, f"PREV_CROSS_UP_UPPER_{k}", "LONG"))
+
+            if is_short:
+                for k in (1, 2, 3):
+                    lvl = bands.get(f"LOWER_{k}")
+                    if pd.notna(lvl) and prev_close >= lvl > curr_close:
+                        prev_cross_downs_short.append((sym, dstr, f"PREV_CROSS_DOWN_LOWER_{k}", "SHORT"))
+
         # LONGS: bounce off previous UPPER_1 and move higher
         if is_long and upper_1 is not None:
             if bounce_up_at_level(df, upper_1):
@@ -448,6 +467,10 @@ def run_once():
         write_items(f, prev_bounce_longs)
         f.write("\n")
         write_items(f, prev_bounce_shorts)
+        f.write("\n")
+        write_items(f, prev_cross_ups_long)
+        f.write("\n")
+        write_items(f, prev_cross_downs_short)
         f.write("\n")
         f.write(f"Run completed at {datetime.now().strftime('%H:%M:%S')}\n")
 
