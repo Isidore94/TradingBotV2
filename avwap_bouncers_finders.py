@@ -99,7 +99,8 @@ def load_bouncers(path: str) -> set:
 
 def parse_avwap_line(line: str):
     """
-    Expect combined_avwap.txt line: SYMBOL,MM/DD,LEVEL,SIDE
+    Expect combined_avwap.txt signal line: ``SYMBOL,MM/DD,LEVEL,SIDE``.
+    Section headers (lines starting with ``#``) are ignored.
     Returns tuple or None.
     """
     parts = [p.strip() for p in line.strip().split(",")]
